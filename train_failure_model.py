@@ -9,7 +9,8 @@ Akış:
   1. Veriyi yükle (`;` ayraçlı, `,` ondalık).
   2. Sızıntısız (causal) feature engineering uygula.
   3. Takvim-bazlı 60/20/20 split (gelecekten geçmişe sızıntı yok).
-  4. LightGBM eğit (sınıf dengesizliği için scale_pos_weight + early stopping).
+  4. LightGBM eğit (sınıf dengesizliği için scale_pos_weight; sabit ağaç sayısı,
+     --early-stopping ile validation üzerinde early stopping opsiyonel).
   5. Validation + test üzerinde ROC-AUC / PR-AUC / classification_report raporla.
   6. Eşik seç (alarm-oranı veya sabit eşik).
   7. (Opsiyonel) Optuna ile hiperparametre araması, SHAP ile özellik önemi.
@@ -49,7 +50,7 @@ warnings.filterwarnings("ignore", category=UserWarning)
 PREDICTION_HORIZON_DAYS = 30          # Bu sürümde sabit: failure_next_30d
 DEFAULT_DATA = "3_years_data.csv"
 DEFAULT_OUT = "outputs"
-ALARM_RATE = 0.40                     # Her dönemde en riskli %40 araç pozitif işaretlenir
+ALARM_RATE = 0.10                     # Precision-odaklı varsayılan: her dönemde en riskli %10
 RANDOM_STATE = 42
 TRAIN_FRAC, VAL_FRAC = 0.60, 0.20     # Test = kalan %20 (takvim bazlı)
 EARLY_STOPPING_ROUNDS = 50
@@ -109,6 +110,28 @@ def engineer_features(df: pd.DataFrame) -> pd.DataFrame:
     df["km_roll30_std"] = g.transform(
         lambda s: s.shift(1).rolling(30, min_periods=5).std()
     )
+
+    # --- Arıza geçmişi (causal) ---
+    # `days_since_last_failure` bir arıza olduğunda sıfırlanır; bir önceki güne göre
+    # DÜŞTÜYSE o gün bir arıza olmuştur -> failure_event.
+    dsf_prev = df.groupby("vehicle_id")["days_since_last_failure"].shift(1)
+    df["failure_event"] = (df["days_since_last_failure"] < dsf_prev).astype(int)
+    fe = df.groupby("vehicle_id")["failure_event"]
+    # Hepsi shift(1): bugünün/geleceğin arızası sayıma GİRMEZ (sızıntı yok).
+    df["veh_past_failures"] = fe.transform(lambda s: s.shift(1, fill_value=0).cumsum())
+    df["veh_past_obs"] = df.groupby("vehicle_id").cumcount()  # bugüne kadarki gözlem günü
+    df["veh_past_failure_rate"] = (
+        df["veh_past_failures"] / df["veh_past_obs"].replace(0, np.nan)
+    ).fillna(0.0)
+    df["veh_failures_last_90d"] = fe.transform(
+        lambda s: s.shift(1, fill_value=0).rolling(90, min_periods=1).sum()
+    )
+    # Yardımcı/sürüklenen kolonları düşür:
+    #  - failure_event: bugünü gösterir -> sızıntı, özellik OLAMAZ.
+    #  - veh_past_obs & veh_past_failures: zamanla monoton büyür (time-index proxy);
+    #    zaman-bazlı split'te dağılım kayması yaratıp genellemeyi bozar. Sadece
+    #    durağan veh_past_failure_rate ve veh_failures_last_90d özellik olarak kalır.
+    df = df.drop(columns=["failure_event", "veh_past_obs", "veh_past_failures"])
 
     return df
 
@@ -171,7 +194,7 @@ def build_model(scale_pos_weight: float, params: dict | None = None) -> LGBMClas
     """LightGBM sınıflandırıcı. Bu sürümde tek model; ileride model adına göre
     dallanma eklemek için ayrı fonksiyon olarak tutuldu."""
     base = dict(
-        n_estimators=600,
+        n_estimators=200,
         learning_rate=0.03,
         num_leaves=31,
         max_depth=-1,
@@ -212,6 +235,21 @@ def recall_constrained_threshold(y_true, scores, target_recall: float):
         if recall_score(y_true, pred, zero_division=0) >= target_recall:
             best = (float(t), precision_score(y_true, pred, zero_division=0))
     return best
+
+
+def precision_constrained_threshold(y_true, scores, target_precision: float):
+    """precision >= target altında recall'ı maksimize eden (en düşük uygun) eşik.
+    Dönüş: (eşik, precision, recall) veya hedef hiç tutmazsa None."""
+    ths = np.unique(np.quantile(scores, np.linspace(0.001, 0.999, 400)))
+    for t in ths:  # artan eşik -> ilk hedefi tutan en yüksek recall'ı verir
+        pred = (scores >= t).astype(int)
+        if pred.sum() == 0:
+            continue
+        p = precision_score(y_true, pred, zero_division=0)
+        if p >= target_precision:
+            r = recall_score(y_true, pred, zero_division=0)
+            return (float(t), p, r)
+    return None
 
 
 def f1_optimal_threshold(y_true, scores) -> float:
@@ -374,8 +412,13 @@ def main():
     parser.add_argument("--shap", action="store_true", help="SHAP özellik önemi üret")
     parser.add_argument("--alarm-rate", type=float, default=ALARM_RATE,
                         help="Alarm-oranı eşiği için pozitif yüzdesi (0-1)")
-    parser.add_argument("--threshold-mode", choices=["alarm", "fixed"], default="alarm",
-                        help="Eşik seçim modu")
+    parser.add_argument("--threshold-mode", choices=["alarm", "fixed", "precision"],
+                        default="alarm", help="Eşik seçim modu")
+    parser.add_argument("--target-precision", type=float, default=0.50,
+                        help="'precision' modunda hedeflenen minimum precision")
+    parser.add_argument("--early-stopping", action="store_true",
+                        help="Validation üzerinde early stopping kullan "
+                             "(varsayılan: kapalı — sabit ağaç sayısı)")
     parser.add_argument("--predict", default=None,
                         help="Eğitim sonrası skorlanacak ek CSV yolu")
     args = parser.parse_args()
@@ -413,14 +456,19 @@ def main():
     ytr, yva, yte = train[TARGET].values, val[TARGET].values, test[TARGET].values
 
     model = build_model(spw, best_params)
-    model.fit(
-        Xtr, ytr,
-        eval_set=[(Xva, yva)],
-        eval_metric="auc",
-        callbacks=[early_stopping(EARLY_STOPPING_ROUNDS, verbose=False), log_evaluation(0)],
-    )
-    best_iter = model.best_iteration_ or model.n_estimators
-    print(f"[LightGBM] best iteration (early stopping): {best_iter}")
+    if args.early_stopping:
+        model.fit(
+            Xtr, ytr,
+            eval_set=[(Xva, yva)],
+            eval_metric="auc",
+            callbacks=[early_stopping(EARLY_STOPPING_ROUNDS, verbose=False), log_evaluation(0)],
+        )
+        best_iter = model.best_iteration_ or model.n_estimators
+        print(f"[LightGBM] best iteration (early stopping): {best_iter}")
+    else:
+        model.fit(Xtr, ytr)
+        best_iter = model.n_estimators
+        print(f"[LightGBM] sabit ağaç sayısı: {best_iter} (early stopping kapalı)")
 
     # 6) Skorlar + eşikler
     val_scores = model.predict_proba(Xva)[:, 1]
@@ -435,6 +483,17 @@ def main():
         test_thr = alarm_rate_threshold(test_scores, args.alarm_rate)
         print(f"Eşik modu — alarm-oranı (her dönemde en riskli %{args.alarm_rate*100:.0f}) "
               f"| referans: op(recall>=0.80)={op_t:.3f}, F1-opt={f1opt:.3f}")
+    elif args.threshold_mode == "precision":
+        res = precision_constrained_threshold(yva, val_scores, args.target_precision)
+        if res:
+            val_thr = test_thr = res[0]
+            print(f"Eşik modu — precision-hedef (val precision>={args.target_precision:.2f}) "
+                  f"eşik={res[0]:.3f} | val'de precision={res[1]:.3f}, recall={res[2]:.3f}")
+        else:
+            # Hedefe ulaşılamadı: en yüksek skorlu %10'u işaretle (en konservatif).
+            val_thr = test_thr = alarm_rate_threshold(val_scores, 0.10)
+            print(f"Eşik modu — precision-hedef ({args.target_precision:.2f}) val'de tutmadı; "
+                  f"geri dönüş: en riskli %10, eşik={val_thr:.3f}")
     else:
         val_thr = test_thr = op_t
         print(f"Eşik modu — sabit eşik (val recall>=0.80)={op_t:.3f} "
