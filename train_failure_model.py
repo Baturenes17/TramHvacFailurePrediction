@@ -190,9 +190,35 @@ def build_preprocessor(feature_cols: list[str]) -> ColumnTransformer:
     )
 
 
-def build_model(scale_pos_weight: float, params: dict | None = None) -> LGBMClassifier:
-    """LightGBM sınıflandırıcı. Bu sürümde tek model; ileride model adına göre
-    dallanma eklemek için ayrı fonksiyon olarak tutuldu."""
+MODEL_CHOICES = ["lightgbm", "logreg"]
+
+
+def build_model(model_type: str, scale_pos_weight: float, params: dict | None = None):
+    """Seçilen modeli kur.
+
+    - lightgbm: gradient-boosted ağaçlar (scale_pos_weight ile dengelenir).
+    - logreg:   ölçeklenmiş Lojistik Regresyon (class_weight='balanced').
+      Benchmark'ta bu zayıf-lineer sinyalde ağaç modellerini geçti; bu yüzden
+      precision'ı bir tık yükseltmek için seçenek olarak sunulur.
+    """
+    if model_type == "logreg":
+        from sklearn.linear_model import LogisticRegression
+        from sklearn.preprocessing import StandardScaler
+
+        return Pipeline(
+            steps=[
+                ("scale", StandardScaler()),
+                (
+                    "lr",
+                    LogisticRegression(
+                        max_iter=1000,
+                        class_weight="balanced",
+                        random_state=RANDOM_STATE,
+                    ),
+                ),
+            ]
+        )
+
     base = dict(
         n_estimators=200,
         learning_rate=0.03,
@@ -316,7 +342,7 @@ def tune_optuna(df_trainval, feature_cols, n_trials):
         for tr_idx, va_idx in tscv.split(X):
             Xtr = prep.fit_transform(X.iloc[tr_idx])
             Xva = prep.transform(X.iloc[va_idx])
-            model = build_model(spw, params)
+            model = build_model("lightgbm", spw, params)
             model.fit(Xtr, y[tr_idx])
             p = model.predict_proba(Xva)[:, 1]
             scores.append(average_precision_score(y[va_idx], p))
@@ -407,7 +433,11 @@ def main():
     parser = argparse.ArgumentParser(description="Tram HVAC 30 günlük arıza tahmini")
     parser.add_argument("--data", default=DEFAULT_DATA, help="Eğitim CSV yolu")
     parser.add_argument("--out", default=DEFAULT_OUT, help="Çıktı klasörü")
-    parser.add_argument("--tune", action="store_true", help="Optuna hiperparametre araması")
+    parser.add_argument("--model", choices=MODEL_CHOICES, default="lightgbm",
+                        help="Sınıflandırıcı: 'lightgbm' (varsayılan) veya "
+                             "'logreg' (ölçeklenmiş Lojistik Regresyon — bu veride "
+                             "biraz daha yüksek precision)")
+    parser.add_argument("--tune", action="store_true", help="Optuna hiperparametre araması (yalnız lightgbm)")
     parser.add_argument("--trials", type=int, default=40, help="Optuna deneme sayısı")
     parser.add_argument("--shap", action="store_true", help="SHAP özellik önemi üret")
     parser.add_argument("--alarm-rate", type=float, default=ALARM_RATE,
@@ -442,10 +472,16 @@ def main():
     print(f"Val   size: {len(val)}  dates: {_fmt_range(val)}")
     print(f"Test  size: {len(test)}  dates: {_fmt_range(test)}")
 
-    # (Opsiyonel) Optuna
+    print(f"Model: {args.model}")
+
+    # (Opsiyonel) Optuna — yalnız LightGBM
     best_params = None
     if args.tune:
-        best_params = tune_optuna(pd.concat([train, val]), feature_cols, args.trials)
+        if args.model != "lightgbm":
+            print(f"[Uyarı] --tune yalnız lightgbm için geçerli; "
+                  f"'{args.model}' modelinde atlanıyor.")
+        else:
+            best_params = tune_optuna(pd.concat([train, val]), feature_cols, args.trials)
 
     # 5) Eğitim — preprocessor + LightGBM (early stopping val üzerinde)
     spw = compute_scale_pos_weight(train[TARGET])
@@ -455,8 +491,9 @@ def main():
     Xte = prep.transform(test[feature_cols])
     ytr, yva, yte = train[TARGET].values, val[TARGET].values, test[TARGET].values
 
-    model = build_model(spw, best_params)
-    if args.early_stopping:
+    model = build_model(args.model, spw, best_params)
+    best_iter = None
+    if args.model == "lightgbm" and args.early_stopping:
         model.fit(
             Xtr, ytr,
             eval_set=[(Xva, yva)],
@@ -467,8 +504,11 @@ def main():
         print(f"[LightGBM] best iteration (early stopping): {best_iter}")
     else:
         model.fit(Xtr, ytr)
-        best_iter = model.n_estimators
-        print(f"[LightGBM] sabit ağaç sayısı: {best_iter} (early stopping kapalı)")
+        if args.model == "lightgbm":
+            best_iter = model.n_estimators
+            print(f"[LightGBM] sabit ağaç sayısı: {best_iter} (early stopping kapalı)")
+        else:
+            print(f"[{args.model}] eğitildi (sınıf dengesizliği class_weight='balanced' ile)")
 
     # 6) Skorlar + eşikler
     val_scores = model.predict_proba(Xva)[:, 1]
@@ -508,10 +548,14 @@ def main():
     test_roc = report_split("Test", yte, test_scores, test_thr)
     precision_recall_tradeoff(yte, test_scores)
 
-    # 9) SHAP
+    # 9) SHAP (TreeExplainer — yalnız ağaç tabanlı modeller)
     if args.shap:
-        sample = test[feature_cols].sample(min(2000, len(test)), random_state=RANDOM_STATE)
-        run_shap(prep, model, sample, args.out)
+        if args.model != "lightgbm":
+            print(f"[Uyarı] --shap (TreeExplainer) yalnız lightgbm için; "
+                  f"'{args.model}' modelinde atlanıyor.")
+        else:
+            sample = test[feature_cols].sample(min(2000, len(test)), random_state=RANDOM_STATE)
+            run_shap(prep, model, sample, args.out)
 
     print("\nModel training completed.")
     print("Validation ROC-AUC:", val_roc)
@@ -519,10 +563,12 @@ def main():
 
     # 10) Final model: TÜM veriyle yeniden fit -> güncel skorlama
     spw_full = compute_scale_pos_weight(df[TARGET])
-    final_params = {**(best_params or {}), "n_estimators": int(best_iter)}
+    final_params = dict(best_params or {})
+    if args.model == "lightgbm" and best_iter is not None:
+        final_params["n_estimators"] = int(best_iter)
     final_prep = build_preprocessor(feature_cols)
     Xall = final_prep.fit_transform(df[feature_cols])
-    final_model = build_model(spw_full, final_params)
+    final_model = build_model(args.model, spw_full, final_params)
     final_model.fit(Xall, df[TARGET].values)
 
     score_latest(df, final_prep, final_model, feature_cols, args.alarm_rate, args.out)
