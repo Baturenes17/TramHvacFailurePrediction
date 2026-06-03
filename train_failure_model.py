@@ -449,6 +449,13 @@ def main():
     parser.add_argument("--early-stopping", action="store_true",
                         help="Validation üzerinde early stopping kullan "
                              "(varsayılan: kapalı — sabit ağaç sayısı)")
+    parser.add_argument("--smote", action="store_true",
+                        help="Yalnız TRAIN setine SMOTENC uygula: arıza sınıfını "
+                             "(failure_next_30d=1) çoğalt. val/test'e dokunulmaz.")
+    parser.add_argument("--smote-ratio", default="auto",
+                        help="SMOTE sampling_strategy: 'auto' = 1:1 tam denge "
+                             "(varsayılan). Daha ılımlı için ondalık ver: ör. 0.5 "
+                             "(1 arıza : 2 normal).")
     parser.add_argument("--predict", default=None,
                         help="Eğitim sonrası skorlanacak ek CSV yolu")
     args = parser.parse_args()
@@ -484,12 +491,43 @@ def main():
             best_params = tune_optuna(pd.concat([train, val]), feature_cols, args.trials)
 
     # 5) Eğitim — preprocessor + LightGBM (early stopping val üzerinde)
-    spw = compute_scale_pos_weight(train[TARGET])
     prep = build_preprocessor(feature_cols)
     Xtr = prep.fit_transform(train[feature_cols])
     Xva = prep.transform(val[feature_cols])
     Xte = prep.transform(test[feature_cols])
-    ytr, yva, yte = train[TARGET].values, val[TARGET].values, test[TARGET].values
+    ytr = train[TARGET].values
+    yva, yte = val[TARGET].values, test[TARGET].values
+
+    # 5b) (Opsiyonel) SMOTE — YALNIZ train'e. Arıza sınıfını (failure_next_30d=1)
+    #     sentetik örneklerle çoğaltır. val/test gerçek dağılımıyla kalır (sızıntı yok).
+    #     ÖNEMLİ: preprocessor'dan SONRA uygulanır. Çünkü SMOTENC NaN kabul etmez;
+    #     ham feature'larda eksikler var ve bunlar SimpleImputer ile burada dolduruldu.
+    #     ColumnTransformer çıktısında kolon sırası [sayısal..., kategorik...] olduğu
+    #     için kategorik (ordinal-encoded) kolonlar en sonda yer alır.
+    if args.smote:
+        from imblearn.over_sampling import SMOTENC
+
+        n_num = len([c for c in feature_cols if c not in CATEGORICAL_FEATURES])
+        n_cat = len([c for c in feature_cols if c in CATEGORICAL_FEATURES])
+        cat_idx = list(range(n_num, n_num + n_cat))  # encode'lu kategorikler en sonda
+        try:
+            strat = float(args.smote_ratio)
+        except ValueError:
+            strat = args.smote_ratio  # "auto" = 1:1
+        sm = SMOTENC(categorical_features=cat_idx, sampling_strategy=strat,
+                     random_state=RANDOM_STATE)
+        n_before, pos_before = len(Xtr), int((ytr == 1).sum())
+        Xtr, ytr = sm.fit_resample(Xtr, ytr)
+        pos_after = int((ytr == 1).sum())
+        print(f"[SMOTE] train {n_before} -> {len(Xtr)} satır | "
+              f"arıza(1): {pos_before} -> {pos_after} "
+              f"(+{pos_after - pos_before} sentetik) | "
+              f"1-oranı: {pos_before/n_before*100:.1f}% -> "
+              f"{pos_after/len(Xtr)*100:.1f}%")
+
+    # NOT: SMOTE dengeyi düzelttiğinde scale_pos_weight'i SMOTE SONRASI y'den
+    # hesaplıyoruz (yoksa hem oversampling hem ağırlık -> çifte düzeltme).
+    spw = compute_scale_pos_weight(pd.Series(ytr))
 
     model = build_model(args.model, spw, best_params)
     best_iter = None
