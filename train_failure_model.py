@@ -8,10 +8,10 @@ Amaç: `3_years_data.csv` içindeki `failure_next_30d` etiketini kullanarak bir 
 Akış:
   1. Veriyi yükle (`;` ayraçlı, `,` ondalık).
   2. Sızıntısız (causal) feature engineering uygula.
-  3. Takvim-bazlı 60/20/20 split (gelecekten geçmişe sızıntı yok).
+  3. Takvim-bazlı 80/20 train/test split (gelecekten geçmişe sızıntı yok).
   4. LightGBM eğit (sınıf dengesizliği için scale_pos_weight; sabit ağaç sayısı,
-     --early-stopping ile validation üzerinde early stopping opsiyonel).
-  5. Validation + test üzerinde ROC-AUC / PR-AUC / classification_report raporla.
+     --early-stopping ile test üzerinde early stopping opsiyonel).
+  5. Test üzerinde ROC-AUC / PR-AUC / classification_report raporla.
   6. Eşik seç (alarm-oranı veya sabit eşik).
   7. (Opsiyonel) Optuna ile hiperparametre araması, SHAP ile özellik önemi.
   8. Tüm veriyle final modeli fit edip her aracın EN GÜNCEL gününü skorla ->
@@ -52,7 +52,7 @@ DEFAULT_DATA = "3_years_data.csv"
 DEFAULT_OUT = "outputs"
 ALARM_RATE = 0.10                     # Precision-odaklı varsayılan: her dönemde en riskli %10
 RANDOM_STATE = 42
-TRAIN_FRAC, VAL_FRAC = 0.60, 0.20     # Test = kalan %20 (takvim bazlı)
+TRAIN_FRAC = 0.80                     # Test = kalan %20 (takvim bazlı)
 EARLY_STOPPING_ROUNDS = 50
 
 TARGET = f"failure_next_{PREDICTION_HORIZON_DAYS}d"
@@ -146,16 +146,14 @@ def get_feature_columns(df: pd.DataFrame) -> list[str]:
 # 4. Takvim bazlı bölme
 # --------------------------------------------------------------------------- #
 def time_based_split(df: pd.DataFrame):
-    """Tarih aralığına göre 60/20/20 (takvim bazlı). Kronolojik kesim — sızıntı yok."""
+    """Tarih aralığına göre 80/20 train/test (takvim bazlı). Kronolojik kesim — sızıntı yok."""
     df_sorted = df.sort_values("date").reset_index(drop=True)
     dmin, dmax = df_sorted["date"].min(), df_sorted["date"].max()
     span = dmax - dmin
     train_end = dmin + span * TRAIN_FRAC
-    val_end = dmin + span * (TRAIN_FRAC + VAL_FRAC)
     train = df_sorted[df_sorted["date"] <= train_end]
-    val = df_sorted[(df_sorted["date"] > train_end) & (df_sorted["date"] <= val_end)]
-    test = df_sorted[df_sorted["date"] > val_end]
-    return train, val, test
+    test = df_sorted[df_sorted["date"] > train_end]
+    return train, test
 
 
 def _fmt_range(s: pd.DataFrame) -> str:
@@ -317,12 +315,12 @@ def precision_recall_tradeoff(y_true, scores):
 # --------------------------------------------------------------------------- #
 # 8. Optuna ile hiperparametre araması (opsiyonel)
 # --------------------------------------------------------------------------- #
-def tune_optuna(df_trainval, feature_cols, n_trials):
+def tune_optuna(df_train, feature_cols, n_trials):
     import optuna
     from sklearn.model_selection import TimeSeriesSplit
 
     optuna.logging.set_verbosity(optuna.logging.WARNING)
-    df_sorted = df_trainval.sort_values("date").reset_index(drop=True)
+    df_sorted = df_train.sort_values("date").reset_index(drop=True)
     X = df_sorted[feature_cols]
     y = df_sorted[TARGET].values
     spw = compute_scale_pos_weight(df_sorted[TARGET])
@@ -447,11 +445,12 @@ def main():
     parser.add_argument("--target-precision", type=float, default=0.50,
                         help="'precision' modunda hedeflenen minimum precision")
     parser.add_argument("--early-stopping", action="store_true",
-                        help="Validation üzerinde early stopping kullan "
-                             "(varsayılan: kapalı — sabit ağaç sayısı)")
+                        help="Test üzerinde early stopping kullan "
+                             "(varsayılan: kapalı — sabit ağaç sayısı; "
+                             "test'e baktığı için önerilmez)")
     parser.add_argument("--smote", action="store_true",
                         help="Yalnız TRAIN setine SMOTENC uygula: arıza sınıfını "
-                             "(failure_next_30d=1) çoğalt. val/test'e dokunulmaz.")
+                             "(failure_next_30d=1) çoğalt. test'e dokunulmaz.")
     parser.add_argument("--smote-ratio", default="auto",
                         help="SMOTE sampling_strategy: 'auto' = 1:1 tam denge "
                              "(varsayılan). Daha ılımlı için ondalık ver: ör. 0.5 "
@@ -474,9 +473,8 @@ def main():
     assert TARGET not in feature_cols and OTHER_LABEL not in feature_cols, "Sızıntı!"
 
     # 4) Takvim bazlı bölme
-    train, val, test = time_based_split(df)
+    train, test = time_based_split(df)
     print(f"Train size: {len(train)}  dates: {_fmt_range(train)}")
-    print(f"Val   size: {len(val)}  dates: {_fmt_range(val)}")
     print(f"Test  size: {len(test)}  dates: {_fmt_range(test)}")
 
     print(f"Model: {args.model}")
@@ -488,18 +486,17 @@ def main():
             print(f"[Uyarı] --tune yalnız lightgbm için geçerli; "
                   f"'{args.model}' modelinde atlanıyor.")
         else:
-            best_params = tune_optuna(pd.concat([train, val]), feature_cols, args.trials)
+            best_params = tune_optuna(train, feature_cols, args.trials)
 
-    # 5) Eğitim — preprocessor + LightGBM (early stopping val üzerinde)
+    # 5) Eğitim — preprocessor + LightGBM (early stopping test üzerinde)
     prep = build_preprocessor(feature_cols)
     Xtr = prep.fit_transform(train[feature_cols])
-    Xva = prep.transform(val[feature_cols])
     Xte = prep.transform(test[feature_cols])
     ytr = train[TARGET].values
-    yva, yte = val[TARGET].values, test[TARGET].values
+    yte = test[TARGET].values
 
     # 5b) (Opsiyonel) SMOTE — YALNIZ train'e. Arıza sınıfını (failure_next_30d=1)
-    #     sentetik örneklerle çoğaltır. val/test gerçek dağılımıyla kalır (sızıntı yok).
+    #     sentetik örneklerle çoğaltır. test gerçek dağılımıyla kalır (sızıntı yok).
     #     ÖNEMLİ: preprocessor'dan SONRA uygulanır. Çünkü SMOTENC NaN kabul etmez;
     #     ham feature'larda eksikler var ve bunlar SimpleImputer ile burada dolduruldu.
     #     ColumnTransformer çıktısında kolon sırası [sayısal..., kategorik...] olduğu
@@ -532,14 +529,18 @@ def main():
     model = build_model(args.model, spw, best_params)
     best_iter = None
     if args.model == "lightgbm" and args.early_stopping:
+        # NOT: Ayrı validation seti kaldırıldı; early stopping istenirse eval seti
+        # olarak test kullanılır. Bu, test metriklerini hafifçe iyimser yapar —
+        # bu yüzden early stopping varsayılan KAPALIDIR ve önerilmez (alarm-oranı
+        # eşiği + sabit ağaç sayısı tercih edilir).
         model.fit(
             Xtr, ytr,
-            eval_set=[(Xva, yva)],
+            eval_set=[(Xte, yte)],
             eval_metric="auc",
             callbacks=[early_stopping(EARLY_STOPPING_ROUNDS, verbose=False), log_evaluation(0)],
         )
         best_iter = model.best_iteration_ or model.n_estimators
-        print(f"[LightGBM] best iteration (early stopping): {best_iter}")
+        print(f"[LightGBM] best iteration (early stopping, eval=test): {best_iter}")
     else:
         model.fit(Xtr, ytr)
         if args.model == "lightgbm":
@@ -549,38 +550,43 @@ def main():
             print(f"[{args.model}] eğitildi (sınıf dengesizliği class_weight='balanced' ile)")
 
     # 6) Skorlar + eşikler
-    val_scores = model.predict_proba(Xva)[:, 1]
+    #    Validation seti kaldırıldı; sabit-eşik modları (fixed/precision) için
+    #    referans olarak TRAIN skorları kullanılır (test'e bakarak eşik seçmek
+    #    sızıntı olurdu). Train üzerinde seçilen eşikler iyimser olabilir; bu
+    #    yüzden alarm-oranı modu (her split kendi quantile'ı) varsayılan ve önerilendir.
+    train_scores = model.predict_proba(Xtr)[:, 1]
     test_scores = model.predict_proba(Xte)[:, 1]
 
-    op = recall_constrained_threshold(yva, val_scores, 0.80)
+    op = recall_constrained_threshold(ytr, train_scores, 0.80)
     op_t = op[0] if op else float("nan")
-    f1opt = f1_optimal_threshold(yva, val_scores)
+    f1opt = f1_optimal_threshold(ytr, train_scores)
 
     if args.threshold_mode == "alarm":
-        val_thr = alarm_rate_threshold(val_scores, args.alarm_rate)
+        # Her split kendi quantile'ını kullanır (train ve test için ayrı eşik).
+        train_thr = alarm_rate_threshold(train_scores, args.alarm_rate)
         test_thr = alarm_rate_threshold(test_scores, args.alarm_rate)
-        print(f"Eşik modu — alarm-oranı (her dönemde en riskli %{args.alarm_rate*100:.0f}) "
-              f"| referans: op(recall>=0.80)={op_t:.3f}, F1-opt={f1opt:.3f}")
+        print(f"Eşik modu — alarm-oranı (en riskli %{args.alarm_rate*100:.0f}) "
+              f"| referans (train): op(recall>=0.80)={op_t:.3f}, F1-opt={f1opt:.3f}")
     elif args.threshold_mode == "precision":
-        res = precision_constrained_threshold(yva, val_scores, args.target_precision)
+        res = precision_constrained_threshold(ytr, train_scores, args.target_precision)
         if res:
-            val_thr = test_thr = res[0]
-            print(f"Eşik modu — precision-hedef (val precision>={args.target_precision:.2f}) "
-                  f"eşik={res[0]:.3f} | val'de precision={res[1]:.3f}, recall={res[2]:.3f}")
+            train_thr = test_thr = res[0]
+            print(f"Eşik modu — precision-hedef (train precision>={args.target_precision:.2f}) "
+                  f"eşik={res[0]:.3f} | train'de precision={res[1]:.3f}, recall={res[2]:.3f}")
         else:
             # Hedefe ulaşılamadı: en yüksek skorlu %10'u işaretle (en konservatif).
-            val_thr = test_thr = alarm_rate_threshold(val_scores, 0.10)
-            print(f"Eşik modu — precision-hedef ({args.target_precision:.2f}) val'de tutmadı; "
-                  f"geri dönüş: en riskli %10, eşik={val_thr:.3f}")
+            train_thr = test_thr = alarm_rate_threshold(train_scores, 0.10)
+            print(f"Eşik modu — precision-hedef ({args.target_precision:.2f}) train'de tutmadı; "
+                  f"geri dönüş: en riskli %10, eşik={test_thr:.3f}")
     else:
-        val_thr = test_thr = op_t
-        print(f"Eşik modu — sabit eşik (val recall>=0.80)={op_t:.3f} "
+        train_thr = test_thr = op_t
+        print(f"Eşik modu — sabit eşik (train recall>=0.80)={op_t:.3f} "
               f"| referans: F1-opt={f1opt:.3f}")
 
-    # 7) Per-split raporlar
-    print("\n--- VALIDATION ---")
-    val_roc = report_split("Validation", yva, val_scores, val_thr)
-    precision_recall_tradeoff(yva, val_scores)
+    # 7) Per-split raporlar (train + test)
+    print("\n--- TRAIN ---")
+    train_roc = report_split("Train", ytr, train_scores, train_thr)
+    precision_recall_tradeoff(ytr, train_scores)
 
     print("\n--- TEST ---")
     test_roc = report_split("Test", yte, test_scores, test_thr)
@@ -596,7 +602,7 @@ def main():
             run_shap(prep, model, sample, args.out)
 
     print("\nModel training completed.")
-    print("Validation ROC-AUC:", val_roc)
+    print("Train ROC-AUC:", train_roc)
     print("Test ROC-AUC:", test_roc)
 
     # 10) Final model: TÜM veriyle yeniden fit -> güncel skorlama
