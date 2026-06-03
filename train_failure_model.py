@@ -188,7 +188,67 @@ def build_preprocessor(feature_cols: list[str]) -> ColumnTransformer:
     )
 
 
-MODEL_CHOICES = ["lightgbm", "logreg"]
+MODEL_CHOICES = ["lightgbm", "logreg", "xgboost", "catboost", "ensemble"]
+# TreeExplainer (SHAP) ve early stopping yalnızca bu ağaç tabanlı modeller için anlamlı.
+TREE_MODELS = {"lightgbm", "xgboost", "catboost"}
+
+
+def _build_lightgbm(scale_pos_weight: float, params: dict | None = None):
+    base = dict(
+        n_estimators=200,
+        learning_rate=0.03,
+        num_leaves=31,
+        max_depth=-1,
+        subsample=0.8,
+        subsample_freq=1,
+        colsample_bytree=0.8,
+        reg_lambda=1.0,
+        scale_pos_weight=scale_pos_weight,
+        random_state=RANDOM_STATE,
+        n_jobs=-1,
+        verbose=-1,
+    )
+    if params:
+        base.update(params)
+    return LGBMClassifier(**base)
+
+
+def _build_xgboost(scale_pos_weight: float, params: dict | None = None):
+    from xgboost import XGBClassifier
+
+    base = dict(
+        n_estimators=200,
+        learning_rate=0.03,
+        max_depth=4,
+        subsample=0.8,
+        colsample_bytree=0.8,
+        reg_lambda=1.0,
+        scale_pos_weight=scale_pos_weight,
+        eval_metric="logloss",
+        random_state=RANDOM_STATE,
+        n_jobs=-1,
+    )
+    if params:
+        base.update(params)
+    return XGBClassifier(**base)
+
+
+def _build_catboost(scale_pos_weight: float, params: dict | None = None):
+    from catboost import CatBoostClassifier
+
+    base = dict(
+        iterations=300,
+        learning_rate=0.03,
+        depth=6,
+        l2_leaf_reg=3.0,
+        scale_pos_weight=scale_pos_weight,
+        random_seed=RANDOM_STATE,
+        verbose=0,
+        allow_writing_files=False,  # catboost_info/ klasörü oluşturma
+    )
+    if params:
+        base.update(params)
+    return CatBoostClassifier(**base)
 
 
 def build_model(model_type: str, scale_pos_weight: float, params: dict | None = None):
@@ -198,6 +258,14 @@ def build_model(model_type: str, scale_pos_weight: float, params: dict | None = 
     - logreg:   ölçeklenmiş Lojistik Regresyon (class_weight='balanced').
       Benchmark'ta bu zayıf-lineer sinyalde ağaç modellerini geçti; bu yüzden
       precision'ı bir tık yükseltmek için seçenek olarak sunulur.
+    - xgboost / catboost: alternatif gradient-boosting kütüphaneleri; aynı
+      scale_pos_weight dengelemesiyle. SHAP ve early stopping desteklenir.
+    - ensemble: lightgbm + xgboost + catboost olasılıklarının soft-voting
+      ortalaması (her biri scale_pos_weight ile dengeli). Tek modellerin
+      gürültüsünü ortalayarak daha kararlı skor amaçlar.
+
+    `params` yalnızca tekil ağaç modellerine uygulanır (ensemble alt modelleri
+    varsayılan parametrelerle kurulur).
     """
     if model_type == "logreg":
         from sklearn.linear_model import LogisticRegression
@@ -217,23 +285,25 @@ def build_model(model_type: str, scale_pos_weight: float, params: dict | None = 
             ]
         )
 
-    base = dict(
-        n_estimators=200,
-        learning_rate=0.03,
-        num_leaves=31,
-        max_depth=-1,
-        subsample=0.8,
-        subsample_freq=1,
-        colsample_bytree=0.8,
-        reg_lambda=1.0,
-        scale_pos_weight=scale_pos_weight,
-        random_state=RANDOM_STATE,
-        n_jobs=-1,
-        verbose=-1,
-    )
-    if params:
-        base.update(params)
-    return LGBMClassifier(**base)
+    if model_type == "lightgbm":
+        return _build_lightgbm(scale_pos_weight, params)
+    if model_type == "xgboost":
+        return _build_xgboost(scale_pos_weight, params)
+    if model_type == "catboost":
+        return _build_catboost(scale_pos_weight, params)
+    if model_type == "ensemble":
+        from sklearn.ensemble import VotingClassifier
+
+        return VotingClassifier(
+            estimators=[
+                ("lgbm", _build_lightgbm(scale_pos_weight)),
+                ("xgb", _build_xgboost(scale_pos_weight)),
+                ("cat", _build_catboost(scale_pos_weight)),
+            ],
+            voting="soft",
+        )
+
+    raise ValueError(f"Bilinmeyen model_type: {model_type}")
 
 
 def compute_scale_pos_weight(y: pd.Series) -> float:
@@ -432,9 +502,10 @@ def main():
     parser.add_argument("--data", default=DEFAULT_DATA, help="Eğitim CSV yolu")
     parser.add_argument("--out", default=DEFAULT_OUT, help="Çıktı klasörü")
     parser.add_argument("--model", choices=MODEL_CHOICES, default="lightgbm",
-                        help="Sınıflandırıcı: 'lightgbm' (varsayılan) veya "
-                             "'logreg' (ölçeklenmiş Lojistik Regresyon — bu veride "
-                             "biraz daha yüksek precision)")
+                        help="Sınıflandırıcı: 'lightgbm' (varsayılan), 'logreg' "
+                             "(ölçeklenmiş Lojistik Regresyon — bu veride biraz daha "
+                             "yüksek precision), 'xgboost', 'catboost' veya 'ensemble' "
+                             "(lightgbm+xgboost+catboost soft-voting)")
     parser.add_argument("--tune", action="store_true", help="Optuna hiperparametre araması (yalnız lightgbm)")
     parser.add_argument("--trials", type=int, default=40, help="Optuna deneme sayısı")
     parser.add_argument("--shap", action="store_true", help="SHAP özellik önemi üret")
@@ -528,6 +599,9 @@ def main():
 
     model = build_model(args.model, spw, best_params)
     best_iter = None
+    if args.early_stopping and args.model != "lightgbm":
+        print(f"[Uyarı] --early-stopping yalnız lightgbm için uygulanır; "
+              f"'{args.model}' modelinde atlanıyor.")
     if args.model == "lightgbm" and args.early_stopping:
         # NOT: Ayrı validation seti kaldırıldı; early stopping istenirse eval seti
         # olarak test kullanılır. Bu, test metriklerini hafifçe iyimser yapar —
@@ -546,8 +620,10 @@ def main():
         if args.model == "lightgbm":
             best_iter = model.n_estimators
             print(f"[LightGBM] sabit ağaç sayısı: {best_iter} (early stopping kapalı)")
+        elif args.model == "logreg":
+            print("[logreg] eğitildi (sınıf dengesizliği class_weight='balanced' ile)")
         else:
-            print(f"[{args.model}] eğitildi (sınıf dengesizliği class_weight='balanced' ile)")
+            print(f"[{args.model}] eğitildi (sınıf dengesizliği scale_pos_weight ile)")
 
     # 6) Skorlar + eşikler
     #    Validation seti kaldırıldı; sabit-eşik modları (fixed/precision) için
@@ -594,9 +670,9 @@ def main():
 
     # 9) SHAP (TreeExplainer — yalnız ağaç tabanlı modeller)
     if args.shap:
-        if args.model != "lightgbm":
-            print(f"[Uyarı] --shap (TreeExplainer) yalnız lightgbm için; "
-                  f"'{args.model}' modelinde atlanıyor.")
+        if args.model not in TREE_MODELS:
+            print(f"[Uyarı] --shap (TreeExplainer) yalnız ağaç modelleri için "
+                  f"({', '.join(sorted(TREE_MODELS))}); '{args.model}' atlanıyor.")
         else:
             sample = test[feature_cols].sample(min(2000, len(test)), random_state=RANDOM_STATE)
             run_shap(prep, model, sample, args.out)

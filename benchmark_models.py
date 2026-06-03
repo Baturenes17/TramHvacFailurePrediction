@@ -27,7 +27,7 @@ ALARM_RATE = 0.10  # sabit çalışma noktası: en riskli %10
 def main():
     df = T.engineer_features(T.load_data(T.DEFAULT_DATA))
     feat = T.get_feature_columns(df)
-    train, val, test = T.time_based_split(df)
+    train, test = T.time_based_split(df)
 
     prep = T.build_preprocessor(feat)
     Xtr = prep.fit_transform(train[feat]); ytr = train[T.TARGET].values
@@ -48,7 +48,7 @@ def main():
     results = []
 
     # 1) LightGBM (mevcut baseline)
-    m = T.build_model(spw); m.fit(Xtr, ytr)
+    m = T.build_model("lightgbm", spw); m.fit(Xtr, ytr)
     results.append(evaluate("LightGBM (mevcut)", m.predict_proba(Xte)[:, 1]))
 
     # 2) XGBoost
