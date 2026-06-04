@@ -192,6 +192,20 @@ MODEL_CHOICES = ["lightgbm", "logreg", "xgboost", "catboost", "ensemble"]
 # TreeExplainer (SHAP) ve early stopping yalnızca bu ağaç tabanlı modeller için anlamlı.
 TREE_MODELS = {"lightgbm", "xgboost", "catboost"}
 
+# Kısıtlı/regularize LightGBM parametreleri (--regularized). Varsayılan ağaçlar train'i
+# ezberliyordu (train precision ~0.86, test ~0.36). Bu sığ/cezalı ağaçlar ezberi kırar;
+# düşük alarm oranlarında test precision'ı belirgin yükseltir (örn. %1 alarmda ~0.61).
+REGULARIZED_LGBM_PARAMS = dict(
+    n_estimators=120,
+    learning_rate=0.02,
+    num_leaves=8,
+    max_depth=3,
+    min_child_samples=200,
+    reg_lambda=5.0,
+    subsample=0.7,
+    colsample_bytree=0.7,
+)
+
 
 def _build_lightgbm(scale_pos_weight: float, params: dict | None = None):
     base = dict(
@@ -506,6 +520,10 @@ def main():
                              "(ölçeklenmiş Lojistik Regresyon — bu veride biraz daha "
                              "yüksek precision), 'xgboost', 'catboost' veya 'ensemble' "
                              "(lightgbm+xgboost+catboost soft-voting)")
+    parser.add_argument("--regularized", action="store_true",
+                        help="Kısıtlı/regularize LightGBM parametrelerini kullan "
+                             "(sığ ağaçlar; overfit'i azaltır, düşük --alarm-rate ile "
+                             "test precision'ı yükseltir). Yalnız lightgbm.")
     parser.add_argument("--tune", action="store_true", help="Optuna hiperparametre araması (yalnız lightgbm)")
     parser.add_argument("--trials", type=int, default=40, help="Optuna deneme sayısı")
     parser.add_argument("--shap", action="store_true", help="SHAP özellik önemi üret")
@@ -558,6 +576,18 @@ def main():
                   f"'{args.model}' modelinde atlanıyor.")
         else:
             best_params = tune_optuna(train, feature_cols, args.trials)
+
+    # (Opsiyonel) Kısıtlı/regularize LightGBM parametreleri (--tune verilmemişse).
+    if args.regularized:
+        if args.model != "lightgbm":
+            print(f"[Uyarı] --regularized yalnız lightgbm için geçerli; "
+                  f"'{args.model}' modelinde atlanıyor.")
+        elif best_params is not None:
+            print("[Uyarı] --tune ile --regularized birlikte verildi; "
+                  "Optuna parametreleri kullanılıyor.")
+        else:
+            best_params = REGULARIZED_LGBM_PARAMS
+            print(f"[regularized] Kısıtlı LightGBM parametreleri: {best_params}")
 
     # 5) Eğitim — preprocessor + LightGBM (early stopping test üzerinde)
     prep = build_preprocessor(feature_cols)

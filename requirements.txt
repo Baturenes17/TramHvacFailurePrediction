@@ -4,3 +4,5 @@ scikit-learn
 lightgbm
 xgboost
 catboost
+prophet
+matplotlib

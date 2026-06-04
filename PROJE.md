@@ -279,3 +279,64 @@ python train_failure_model.py --predict yeni_veri.csv
 - **Model çeşitliliği:** `build_model()` artık `lightgbm`/`logreg`/`xgboost`/`catboost`/`ensemble`
   destekler. Yine de bu veride yeni boosting modelleri test başarısını yükseltmedi (bkz. §6 karşılaştırma
   tablosu) — darboğaz model değil, **veri/sinyal**. Stacking veya kalibrasyon denenebilir ama beklenti düşük.
+
+---
+
+## 10. Tamamlayıcı Bileşen — Filo Geneli Arıza Tahmini (`forecast_failures_prophet.py`)
+
+`train_failure_model.py` **araç-bazlı** soruya cevap verir ("hangi araç 30 gün içinde arıza yapar?").
+`forecast_failures_prophet.py` ise **farklı bir iş sorusunu** Facebook Prophet ile çözer:
+**"Önümüzdeki dönemde filo genelinde kaç HVAC arızası beklenir?"** — bakım kapasitesi / personel planlaması
+için. İki bileşen birbirinin yerine geçmez; tamamlayıcıdır.
+
+### Neden zaman serisi / Prophet?
+- Filo geneli arıza sayısı **tek değişkenli, takvim-indeksli sürekli bir seridir**. Trend + güçlü yıllık
+  mevsimsellik (yaz HVAC yükü) içerir — Prophet'in tam güçlü olduğu alan.
+- **Per-vehicle Prophet neden tercih edilmedi:** 80 aracın her birinin arıza serisi seyrek ve ikilidir;
+  Prophet ikili olay/olasılık üretmez, sürekli değer üretir. Araç önceliklendirme zaten sınıflandırma
+  modeliyle (LightGBM/LogReg) daha doğru yapılır. Bu yüzden Prophet yalnızca **agregat filo seviyesinde** kullanılır.
+
+### Akış
+1. **Veri:** `3_years_data.csv` (aynı `;`/`,` formatı).
+2. **Gerçek arıza olayı:** `days_since_last_failure` sayacı bir önceki güne göre düştüğü gün arıza olmuştur
+   (`train_failure_model.py:116-118` ile aynı causal kural). İleriye-dönük `failure_next_*` ETİKETLERİ
+   **kullanılmaz** — onlar gerçek olay değil, etikettir.
+3. **Seri:** Tarihe göre `failure_event` toplanır, eksik günler 0 ile doldurulur; varsayılan **haftalık**
+   (`--freq W`) toplama (seyreklik/gürültü nedeniyle), `--freq D` ile günlük.
+4. **Split:** Kronolojik son %20 holdout (sınıflandırma pipeline'ıyla tutarlı; karıştırma yok).
+5. **Model:** `Prophet(yearly_seasonality=True, weekly_seasonality=(freq=='D'))`. Mevsimsellik modu
+   `--seasonality-mode` ile seçilir; **varsayılan `additive`** (sıfır içeren küçük sayımlarda `multiplicative`
+   trendi aşırı ekstrapole edip naive'den daha kötü sonuç verdiği için). Opsiyonel `--with-weather` ile günlük
+   ortalama `temp`/`humidity` regresör eklenir (canlı tahmin için gelecekteki hava değerleri gerekir; gelecek
+   doldurmada mevsimsel ortalama placeholder kullanılır).
+6. **Değerlendirme:** Holdout MAE/RMSE/MAPE + iki baseline: **naive (düz ortalama, mevsimselliği yok sayar)**
+   ve **mevsimsel naive (geçen yılın aynı dönemi, mevsimselliği yakalar)**. `--cv` ile Prophet çok-katlı
+   genişleyen-pencere cross-validation (tek-yıl holdout'tan daha güvenilir).
+7. **Çıktılar (`outputs/`):** `forecast_failures.csv` (ds, yhat, yhat_lower, yhat_upper),
+   `prophet_forecast.png`, `prophet_components.png`.
+
+### Bulgu (mevcut veride)
+**Mevsimsellik VAR ve güçlü:** ham `failure_event` aya/mevsime göre toplandığında yaz nettir
+(yaz=295, ilkbahar=116, sonbahar=119, kış=79; Temmuz=122, Ağustos=101). Prophet bunu yıllık mevsimsellik
+bileşeninde yakalar (`prophet_components.png`'de yaz tepesi).
+
+**Ama nokta-tahmin doğruluğu yıllar arası kararsızlıktan zarar görüyor.** 2025'te patern kaymış:
+zirve Mayıs'a erken gelmiş (2025-05=55, oysa 2023/24 Mayıs=3/8), Haziran çökmüş (2025-06=11, 2024-06=45).
+Holdout tam da bu anomalili dönemi (2025-06 → 2026-01) içerdiği için:
+- Haftalık holdout MAE: Prophet 5.74, **mevsimsel naive 5.91**, düz ortalama 3.38. Yani bu pencerede
+  *mevsimsel naive bile* düz ortalamayı geçemiyor — sorun mevsimselliğin yokluğu değil, **2025'in farklılığı**.
+- `--cv` (çok-katlı) ortalama MAE ≈ 4.9, ama katlar arası uçtan uca: anomaliyi kaçıran katlar MAE ≈ 1.6–2.7
+  (iyi), anomaliyi vuran katlar MAE ≈ 15–17 (kötü).
+
+**Sonuç:** Model doğru kuruldu ve mevsimselliği öğreniyor; sınırlayıcı, agregat arıza serisindeki
+**yıllar-arası non-stasyonarite**. İyileştirme: changepoint esnekliğini ayarlamak, daha çok yıl veri,
+veya tatil/özel-gün regresörleri. Bu, §9'daki "zamansal non-stasyonarite" notuyla tutarlıdır.
+
+### Çalıştırma
+```bash
+pip install -r requirements.txt           # prophet + matplotlib eklendi
+python forecast_failures_prophet.py --freq W
+python forecast_failures_prophet.py --freq D --with-weather --cv
+```
+**Sağlık kontrolü:** `prophet_components.png`'de yıllık mevsimsellik yaz aylarında tepe yapmalı (HVAC yükü);
+Prophet holdout MAE'si naive baseline'ı geçmiyorsa seri zayıf sinyallidir.
