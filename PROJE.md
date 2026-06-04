@@ -297,7 +297,8 @@ için. İki bileşen birbirinin yerine geçmez; tamamlayıcıdır.
   modeliyle (LightGBM/LogReg) daha doğru yapılır. Bu yüzden Prophet yalnızca **agregat filo seviyesinde** kullanılır.
 
 ### Akış
-1. **Veri:** `3_years_data.csv` (aynı `;`/`,` formatı).
+1. **Veri:** `3_years_data.csv` (varsayılan; aynı `;`/`,` formatı). `--data 3_years_data_no2025.csv` ile
+   2025'i komple çıkaran (2023–2024) temizlenmiş set kullanılabilir — aşağıdaki Bulgu'ya göre en iyi sonucu bu verir.
 2. **Gerçek arıza olayı:** `days_since_last_failure` sayacı bir önceki güne göre düştüğü gün arıza olmuştur
    (`train_failure_model.py:116-118` ile aynı causal kural). İleriye-dönük `failure_next_*` ETİKETLERİ
    **kullanılmaz** — onlar gerçek olay değil, etikettir.
@@ -312,6 +313,10 @@ için. İki bileşen birbirinin yerine geçmez; tamamlayıcıdır.
 6. **Değerlendirme:** Holdout MAE/RMSE/MAPE + iki baseline: **naive (düz ortalama, mevsimselliği yok sayar)**
    ve **mevsimsel naive (geçen yılın aynı dönemi, mevsimselliği yakalar)**. `--cv` ile Prophet çok-katlı
    genişleyen-pencere cross-validation (tek-yıl holdout'tan daha güvenilir).
+   - **Anomali maskeleme (`--outlier-ranges`):** `"BAŞ:BİT,BAŞ:BİT"` formatında verilen tarih aralıklarında
+     `y=NaN` yapılır; Prophet bu noktalara **FIT OLMAZ** (anomaliye çekilmez) ama satırlar korunduğu için
+     mevsimsellik takvimi bozulmaz. Maskelenen noktalar holdout/CV metriklerinden de dışlanır
+     (NaN-güvenli baseline'lar). Örn. `--outlier-ranges "2025-05-01:2025-06-30"`.
 7. **Çıktılar (`outputs/`):** `forecast_failures.csv` (ds, yhat, yhat_lower, yhat_upper),
    `prophet_forecast.png`, `prophet_components.png`.
 
@@ -320,22 +325,44 @@ için. İki bileşen birbirinin yerine geçmez; tamamlayıcıdır.
 (yaz=295, ilkbahar=116, sonbahar=119, kış=79; Temmuz=122, Ağustos=101). Prophet bunu yıllık mevsimsellik
 bileşeninde yakalar (`prophet_components.png`'de yaz tepesi).
 
-**Ama nokta-tahmin doğruluğu yıllar arası kararsızlıktan zarar görüyor.** 2025'te patern kaymış:
-zirve Mayıs'a erken gelmiş (2025-05=55, oysa 2023/24 Mayıs=3/8), Haziran çökmüş (2025-06=11, 2024-06=45).
-Holdout tam da bu anomalili dönemi (2025-06 → 2026-01) içerdiği için:
-- Haftalık holdout MAE: Prophet 5.74, **mevsimsel naive 5.91**, düz ortalama 3.38. Yani bu pencerede
-  *mevsimsel naive bile* düz ortalamayı geçemiyor — sorun mevsimselliğin yokluğu değil, **2025'in farklılığı**.
-- `--cv` (çok-katlı) ortalama MAE ≈ 4.9, ama katlar arası uçtan uca: anomaliyi kaçıran katlar MAE ≈ 1.6–2.7
-  (iyi), anomaliyi vuran katlar MAE ≈ 15–17 (kötü).
+**Ama nokta-tahmin doğruluğu 2025 verisinin bozukluğundan zarar görüyor.** 2025'in ikinci yarısı iki ayrı
+sorun içeriyor (haftalık seride): (a) tekil **spike haftaları** (`2025-05-18`=40, `2025-08-03`=23; seri
+ort. ≈3.6) ve (b) Eylül–Aralık'ta ~0'a **çöküş** — **Aralık 2025 + Ocak 2026 haftaları tamamen sıfır**, ki
+bu büyük olasılıkla gerçek bir düşüş değil, **veri kaydının orada bitmesi** (eksik / sağ-sansürlü veri).
 
-**Sonuç:** Model doğru kuruldu ve mevsimselliği öğreniyor; sınırlayıcı, agregat arıza serisindeki
-**yıllar-arası non-stasyonarite**. İyileştirme: changepoint esnekliğini ayarlamak, daha çok yıl veri,
-veya tatil/özel-gün regresörleri. Bu, §9'daki "zamansal non-stasyonarite" notuyla tutarlıdır.
+**Mayıs–Haziran'ı outlier maskelemek metrikleri iyileştirmedi; 2025'i komple çıkarmak en temiz sonucu verdi.**
+Karşılaştırma (haftalık, `--freq W`):
+
+| Konfigürasyon | CV ort. MAE | Holdout Prophet | Holdout Naive (ort.) |
+|---|---|---|---|
+| **`3_years_data_no2025.csv`** (2023–24) | **3.361** | 4.375 | 3.864 |
+| `3_years_data.csv` + `--outlier-ranges 2025-05-01:2025-06-30` | 4.103 | 5.047 | 3.674 |
+| `3_years_data.csv` + `--outlier-ranges 2025-05-01:2025-08-31` | 3.762 | 4.940 | 2.743 |
+
+Her konfigürasyonda **Prophet düz ortalama (naive) baseline'ı geçemiyor**: haftalık sayımlar küçük/gürültülü
+(0–24) ve elde yalnızca ~2–3 mevsimsel döngü var. Maskeleme yardımcı olmadı, çünkü 2025'in bozukluğu tek
+döneme sıkışmıyor (yaz spike'ları + sonbahar/kış çöküşü); en düşük CV hatası 2025'siz seride.
+
+**Sonuç:** Model doğru kuruldu ve mevsimselliği öğreniyor; asıl sınırlayıcı, agregat seride **yıllar-arası
+non-stasyonarite + 2025 sonu veri eksikliği**. Öneriler: (1) seriyi en güvenilir tarihe kadar **kırpmak**
+(Eylül 2025 sonrası sıfır-akışını maskelemek yerine veriyi kesmek), (2) daha çok yıl / temiz veri,
+(3) changepoint esnekliğini ayarlamak veya tatil/özel-gün regresörleri. Bu, §9'daki "zamansal
+non-stasyonarite" notuyla tutarlıdır.
 
 ### Çalıştırma
 ```bash
 pip install -r requirements.txt           # prophet + matplotlib eklendi
+
+# Varsayılan veri (3_years_data.csv) ile haftalık
 python forecast_failures_prophet.py --freq W
+
+# En temiz sonuç: 2025 komple çıkarılmış set (CV MAE ≈ 3.361)
+python forecast_failures_prophet.py --data 3_years_data_no2025.csv --cv
+
+# Anomali dönem(ler)ini maskeleyerek (y=NaN; Prophet o noktalara fit etmez)
+python forecast_failures_prophet.py --data 3_years_data.csv --outlier-ranges "2025-05-01:2025-06-30" --cv
+
+# Günlük + hava regresörü
 python forecast_failures_prophet.py --freq D --with-weather --cv
 ```
 **Sağlık kontrolü:** `prophet_components.png`'de yıllık mevsimsellik yaz aylarında tepe yapmalı (HVAC yükü);

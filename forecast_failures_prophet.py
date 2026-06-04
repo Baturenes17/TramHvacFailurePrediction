@@ -103,6 +103,23 @@ def build_timeseries(df: pd.DataFrame, freq: str, with_weather: bool) -> pd.Data
     return ts
 
 
+def apply_outliers(ts: pd.DataFrame, ranges: str | None):
+    """Verilen tarih aralıklarındaki y'yi NaN yapar. Prophet bu noktalara FIT OLMAZ
+    (anomaliye çekilmez) ama takvim/mevsimsellik sürekliliği bozulmasın diye satırlar
+    KORUNUR. Bu, Prophet'in tek-seferlik anomaliler için önerdiği yöntemdir.
+    Format: 'BAŞ:BİT,BAŞ:BİT' örn '2025-05-01:2025-06-30'. Döner: (ts, maskelenen_periyot)."""
+    if not ranges:
+        return ts, 0
+    ts = ts.copy()
+    mask = pd.Series(False, index=ts.index)
+    for r in ranges.split(","):
+        start, end = r.split(":")
+        mask |= (ts["ds"] >= pd.Timestamp(start.strip())) & (ts["ds"] <= pd.Timestamp(end.strip()))
+    n = int(mask.sum())
+    ts.loc[mask, "y"] = np.nan
+    return ts, n
+
+
 # --------------------------------------------------------------------------- #
 # 4. Kronolojik bölme
 # --------------------------------------------------------------------------- #
@@ -133,6 +150,7 @@ def seasonal_naive_pred(ts: pd.DataFrame, holdout: pd.DataFrame, freq: str) -> n
     gerçekten ek değer katıp katmadığını test eder."""
     period = 52 if freq == "W" else 365  # bir yıllık geri kayma
     y_full = ts["y"].values
+    fallback = np.nanmean(y_full)  # NaN-güvenli (outlier maskeleme ile uyumlu)
     n_train = len(ts) - len(holdout)
     preds = []
     for i in range(len(holdout)):
@@ -140,7 +158,9 @@ def seasonal_naive_pred(ts: pd.DataFrame, holdout: pd.DataFrame, freq: str) -> n
         # Yeterli geçmiş yoksa eldeki en eski mevsimsel değere geri düş
         while idx < 0:
             idx += period
-        preds.append(y_full[idx] if idx < len(y_full) else ts["y"].mean())
+        val = y_full[idx] if idx < len(y_full) else fallback
+        # Geçen yılın aynı haftası outlier olarak maskelendiyse fallback kullan
+        preds.append(fallback if np.isnan(val) else val)
     return np.asarray(preds, dtype=float)
 
 
@@ -175,6 +195,12 @@ def main() -> None:
         "--cv", action="store_true",
         help="Prophet genişleyen-pencere cross-validation çalıştır",
     )
+    parser.add_argument(
+        "--outlier-ranges", default=None,
+        help="Anomali tarih aralıkları; bu periyodlarda y=NaN yapılır (Prophet fit etmez, "
+             "ama mevsimsellik takvimi korunur). Format: 'BAŞ:BİT,BAŞ:BİT' "
+             "örn '2025-05-01:2025-06-30'",
+    )
     args = parser.parse_args()
 
     # Prophet/matplotlib'i burada import et ki --help bağımlılık olmadan çalışsın
@@ -192,6 +218,7 @@ def main() -> None:
     df = derive_failure_events(df)
     total_failures = int(df["failure_event"].sum())
     ts = build_timeseries(df, freq=args.freq, with_weather=args.with_weather)
+    ts, n_outlier = apply_outliers(ts, args.outlier_ranges)
 
     print("=" * 70)
     print("FİLO GENELİ ARIZA TAHMİNİ — Prophet")
@@ -201,6 +228,9 @@ def main() -> None:
     print(f"Seri uzunluğu         : {len(ts)} periyod "
           f"({ts['ds'].min().date()} - {ts['ds'].max().date()})")
     print(f"Periyod başına y (ort): {ts['y'].mean():.2f}  (min={ts['y'].min():.0f}, max={ts['y'].max():.0f})")
+    if n_outlier:
+        print(f"Outlier maskelenen    : {n_outlier} periyod (y=NaN -> Prophet fit etmez) "
+              f"[{args.outlier_ranges}]")
 
     # --- Kronolojik split ---
     train, holdout = time_based_split(ts)
@@ -228,16 +258,21 @@ def main() -> None:
     holdout_future = holdout[["ds"] + (WEATHER_COLS if args.with_weather else [])].copy()
     holdout_fc = model.predict(holdout_future)
     yhat_holdout = np.clip(holdout_fc["yhat"].values, 0, None)  # negatif arıza sayısı olamaz
-    m_prophet = _metrics(holdout["y"].values, yhat_holdout)
 
-    # Baseline 1 — Naive (düz ortalama): mevsimselliği YOK SAYAR
-    naive_pred = np.full(len(holdout), train["y"].mean())
-    m_naive = _metrics(holdout["y"].values, naive_pred)
+    # Outlier maskeli (y=NaN) holdout noktalarını değerlendirmeden dışla — adil kıyas için
+    # üç model de aynı geçerli noktalarda ölçülür.
+    y_true_h = holdout["y"].values
+    valid = ~np.isnan(y_true_h)
+    m_prophet = _metrics(y_true_h[valid], yhat_holdout[valid])
+
+    # Baseline 1 — Naive (düz ortalama): mevsimselliği YOK SAYAR (NaN-güvenli ortalama)
+    naive_pred = np.full(len(holdout), np.nanmean(train["y"]))
+    m_naive = _metrics(y_true_h[valid], naive_pred[valid])
 
     # Baseline 2 — Mevsimsel naive (geçen yılın aynı dönemi): mevsimselliği YAKALAR.
     # Asıl adil kıyas budur; Prophet bunu geçerse mevsimsellik+trendden ek değer üretiyor demektir.
     snaive_pred = seasonal_naive_pred(ts, holdout, args.freq)
-    m_snaive = _metrics(holdout["y"].values, snaive_pred)
+    m_snaive = _metrics(y_true_h[valid], snaive_pred[valid])
 
     print("\n" + "-" * 70)
     print("HOLDOUT DEĞERLENDİRME")
@@ -278,6 +313,7 @@ def main() -> None:
                 cv_model, initial=initial, period=period, horizon=cv_horizon,
                 parallel=None,
             )
+            cv_df = cv_df.dropna(subset=["y", "yhat"])  # outlier maskeli noktaları hariç tut
             perf = performance_metrics(cv_df)
             # Sıfır içeren serilerde 'mape' üretilmeyebilir -> yalnızca mevcut sütunları göster
             cols = [c for c in ["horizon", "mae", "rmse", "mape", "coverage"] if c in perf.columns]
