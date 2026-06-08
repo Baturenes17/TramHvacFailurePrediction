@@ -295,6 +295,13 @@ için. İki bileşen birbirinin yerine geçmez; tamamlayıcıdır.
 - **Per-vehicle Prophet neden tercih edilmedi:** 80 aracın her birinin arıza serisi seyrek ve ikilidir;
   Prophet ikili olay/olasılık üretmez, sürekli değer üretir. Araç önceliklendirme zaten sınıflandırma
   modeliyle (LightGBM/LogReg) daha doğru yapılır. Bu yüzden Prophet yalnızca **agregat filo seviyesinde** kullanılır.
+- **`--vehicle <id>` (deneysel/gösterim amaçlı):** Tek bir araç için Prophet tahmini denemeyi sağlar
+  (arıza olayları tüm filoda türetildikten sonra tek araca filtrelenir; causal sayaç araç-içi olduğundan
+  sızıntı yoktur). **Ampirik olarak doğrulandı ki çıktı karar-verilebilir değil:** 75 aracın arıza/araç
+  ortalaması 3 yılda yalnızca ~5 (medyan 5, maks 25). En arızalı araç **3814** (25 olay) için bile haftalık
+  seri %85 sıfırdır ve 3 haftalık tahmin ≈ **0.1 arıza/hafta** çıkar — yani "neredeyse kesin arıza yok".
+  Prophet bu durumda baseline'ları MAE'de geçse de bu yanıltıcıdır (her model ~0 tahmin ettiği için).
+  Araç-bazlı soru için doğru araç **`train_failure_model.py`** sınıflandırmasıdır.
 
 ### Akış
 1. **Veri:** `3_years_data.csv` (varsayılan; aynı `;`/`,` formatı). `--data 3_years_data_no2025.csv` ile
@@ -364,6 +371,9 @@ python forecast_failures_prophet.py --data 3_years_data.csv --outlier-ranges "20
 
 # Günlük + hava regresörü
 python forecast_failures_prophet.py --freq D --with-weather --cv
+
+# Tek araç (deneysel; seyreklik nedeniyle çıktı zayıf — yukarıdaki nota bakın)
+python forecast_failures_prophet.py --data 3_years_data_no2025.csv --freq W --horizon 3 --vehicle 3814
 ```
 **Sağlık kontrolü:** `prophet_components.png`'de yıllık mevsimsellik yaz aylarında tepe yapmalı (HVAC yükü);
 Prophet holdout MAE'si naive baseline'ı geçmiyorsa seri zayıf sinyallidir.

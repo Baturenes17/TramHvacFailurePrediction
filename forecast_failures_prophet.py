@@ -174,6 +174,11 @@ def main() -> None:
     parser.add_argument("--data", default=DEFAULT_DATA, help="Girdi CSV yolu")
     parser.add_argument("--out", default=DEFAULT_OUT, help="Çıktı dizini")
     parser.add_argument(
+        "--vehicle", type=int, default=None,
+        help="Sadece bu vehicle_id için tahmin (araç-bazlı). Belirtilmezse filo geneli. "
+             "UYARI: tek araç serisi çok seyrek (sparse) olduğundan Prophet zayıf çalışır.",
+    )
+    parser.add_argument(
         "--freq", choices=["D", "W"], default="W",
         help="Zaman serisi frekansı: D=günlük, W=haftalık (varsayılan: W)",
     )
@@ -216,12 +221,25 @@ def main() -> None:
     # --- Veri & seri ---
     df = load_data(args.data)
     df = derive_failure_events(df)
+
+    # Araç-bazlı mod: arıza olaylarını TÜM filoda türettikten sonra tek araca filtrele
+    # (days_since_last_failure sayacı zaten araç-içi shift ile hesaplandı, sızıntı yok).
+    if args.vehicle is not None:
+        ids = sorted(int(v) for v in df["vehicle_id"].unique())
+        if args.vehicle not in ids:
+            raise SystemExit(
+                f"vehicle_id={args.vehicle} veride yok. Mevcut ID örnekleri: "
+                f"{ids[:10]} ... (toplam {len(ids)} araç)"
+            )
+        df = df[df["vehicle_id"] == args.vehicle].copy()
+
     total_failures = int(df["failure_event"].sum())
     ts = build_timeseries(df, freq=args.freq, with_weather=args.with_weather)
     ts, n_outlier = apply_outliers(ts, args.outlier_ranges)
 
+    scope = f"ARAÇ {args.vehicle}" if args.vehicle is not None else "FİLO GENELİ"
     print("=" * 70)
-    print("FİLO GENELİ ARIZA TAHMİNİ — Prophet")
+    print(f"{scope} ARIZA TAHMİNİ — Prophet")
     print("=" * 70)
     print(f"Frekans               : {args.freq}  (D=günlük, W=haftalık)")
     print(f"Toplam arıza olayı    : {total_failures}")
