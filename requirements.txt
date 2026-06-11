@@ -5,4 +5,5 @@ lightgbm
 xgboost
 catboost
 prophet
+imbalanced-learn
 matplotlib

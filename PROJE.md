@@ -258,6 +258,14 @@ python train_failure_model.py --early-stopping
 python train_failure_model.py --threshold-mode fixed
 python train_failure_model.py --threshold-mode precision --target-precision 0.40
 
+# Sınıf dengeleme — YALNIZ train'e (test gerçek dağılımıyla kalır, sızıntı yok)
+# SMOTE ile azınlığı (arıza=1) sentetik çoğalt: tam 1:1 denge
+python train_failure_model.py --smote
+# SMOTE + hafif undersampling: önce SMOTE azınlığı çoğunluğun %40'ına çıkarır,
+# sonra çoğunluk kısılarak hedef min:maj=0.80'e ulaşılır (tam 1:1'den daha ılımlı,
+# genelde daha iyi genelleme verir). undersample-ratio > smote-ratio olmalı.
+python train_failure_model.py --smote --smote-ratio 0.4 --undersample --undersample-ratio 0.8
+
 # Eğitim sonrası yeni bir dosyayı skorla
 python train_failure_model.py --predict yeni_veri.csv
 ```

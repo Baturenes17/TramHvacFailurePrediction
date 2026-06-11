@@ -596,7 +596,16 @@ def main():
     parser.add_argument("--smote-ratio", default="auto",
                         help="SMOTE sampling_strategy: 'auto' = 1:1 tam denge "
                              "(varsayılan). Daha ılımlı için ondalık ver: ör. 0.5 "
-                             "(1 arıza : 2 normal).")
+                             "(1 arıza : 2 normal). --undersample ile birlikte "
+                             "kullanılırsa bu, SMOTE SONRASI ara dengedir.")
+    parser.add_argument("--undersample", action="store_true",
+                        help="SMOTE'tan SONRA çoğunluğu (failure=0) rastgele "
+                             "altörnekle (hafif undersampling). Yalnız TRAIN'e. "
+                             "--smote ile birlikte kullanılır.")
+    parser.add_argument("--undersample-ratio", type=float, default=0.8,
+                        help="Undersampling sonrası HEDEF azınlık:çoğunluk oranı "
+                             "(min/maj). Ör. 0.8 => 4 arıza : 5 normal. "
+                             "--smote-ratio'dan büyük olmalı.")
     parser.add_argument("--predict", default=None,
                         help="Eğitim sonrası skorlanacak ek CSV yolu")
     parser.add_argument("--test-end", default=None,
@@ -681,8 +690,25 @@ def main():
     #     ham feature'larda eksikler var ve bunlar SimpleImputer ile burada dolduruldu.
     #     ColumnTransformer çıktısında kolon sırası [sayısal..., kategorik...] olduğu
     #     için kategorik (ordinal-encoded) kolonlar en sonda yer alır.
+    if args.undersample and not args.smote:
+        print("[Uyarı] --undersample yalnız --smote ile birlikte uygulanır; "
+              "tek başına verildi, atlanıyor.")
     if args.smote:
         from imblearn.over_sampling import SMOTENC
+
+        # Oran tutarlılığı: undersampling çoğunluğu azaltıp min:maj oranını
+        # YÜKSELTİR; bu yüzden hedef oran, SMOTE sonrası ara orandan büyük olmalı.
+        if args.undersample:
+            try:
+                _sr = float(args.smote_ratio)
+            except ValueError:
+                _sr = 1.0  # "auto" => SMOTE zaten 1:1; undersampling anlamsız
+            if args.undersample_ratio <= _sr:
+                raise ValueError(
+                    f"--undersample-ratio ({args.undersample_ratio}) "
+                    f"--smote-ratio ({_sr}) değerinden BÜYÜK olmalı. "
+                    f"Önce SMOTE azınlığı {_sr:.2f} oranına çıkarır, sonra "
+                    f"undersampling çoğunluğu kısarak oranı yükseltir.")
 
         n_num = len([c for c in feature_cols if c not in CATEGORICAL_FEATURES])
         n_cat = len([c for c in feature_cols if c in CATEGORICAL_FEATURES])
@@ -694,13 +720,39 @@ def main():
         sm = SMOTENC(categorical_features=cat_idx, sampling_strategy=strat,
                      random_state=RANDOM_STATE)
         n_before, pos_before = len(Xtr), int((ytr == 1).sum())
+        neg_before = n_before - pos_before
         Xtr, ytr = sm.fit_resample(Xtr, ytr)
         pos_after = int((ytr == 1).sum())
         print(f"[SMOTE] train {n_before} -> {len(Xtr)} satır | "
               f"arıza(1): {pos_before} -> {pos_after} "
               f"(+{pos_after - pos_before} sentetik) | "
+              f"normal(0): {neg_before} (sabit) | "
               f"1-oranı: {pos_before/n_before*100:.1f}% -> "
               f"{pos_after/len(Xtr)*100:.1f}%")
+
+        # 5c) (Opsiyonel) Hafif undersampling — SMOTE'tan SONRA çoğunluğu (0) kıs.
+        #     SMOTE azınlığı ara dengeye (smote-ratio) çıkarır; ardından çoğunluk
+        #     azaltılarak hedef min:maj oranına (undersample-ratio) ulaşılır.
+        #     Tam 1:1 yerine ılımlı denge çoğu zaman daha iyi genelleme verir.
+        #     Yalnız train; test gerçek dağılımıyla kalır (sızıntı yok).
+        if args.undersample:
+            from imblearn.under_sampling import RandomUnderSampler
+
+            if args.undersample_ratio <= 0 or args.undersample_ratio > 1:
+                raise ValueError("--undersample-ratio (0, 1] aralığında olmalı.")
+            us = RandomUnderSampler(sampling_strategy=args.undersample_ratio,
+                                    random_state=RANDOM_STATE)
+            n_pre, pos_pre = len(Xtr), int((ytr == 1).sum())
+            neg_pre = n_pre - pos_pre
+            Xtr, ytr = us.fit_resample(Xtr, ytr)
+            pos_post = int((ytr == 1).sum())
+            neg_post = len(Xtr) - pos_post
+            print(f"[UNDER] train {n_pre} -> {len(Xtr)} satır | "
+                  f"normal(0): {neg_pre} -> {neg_post} "
+                  f"(-{neg_pre - neg_post}) | arıza(1): {pos_post} (sabit) | "
+                  f"hedef min:maj={args.undersample_ratio:.2f} | "
+                  f"1-oranı: {pos_pre/n_pre*100:.1f}% -> "
+                  f"{pos_post/len(Xtr)*100:.1f}%")
 
     # NOT: SMOTE dengeyi düzelttiğinde scale_pos_weight'i SMOTE SONRASI y'den
     # hesaplıyoruz (yoksa hem oversampling hem ağırlık -> çifte düzeltme).
