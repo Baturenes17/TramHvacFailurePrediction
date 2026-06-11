@@ -61,7 +61,14 @@ ID_COLS = ["date", "vehicle_id"]
 RECALL_TARGETS = [0.90, 0.80, 0.70, 0.60, 0.50]
 
 # Kategorik olarak ele alınacak ham/üretilmiş sütunlar
-CATEGORICAL_FEATURES = ["vehicle_type", "weather_type", "season"]
+# NOT: `cevre_temizligi` (temiz/karli/...) ham veride metin kategoriktir; listeye
+# dahil değilse get_feature_columns onu sayısal sanır ve SimpleImputer(median)
+# 'temiz'i float'a çeviremeyip hata verir.
+# `mevsim` (kis/ilkbahar/...) türetilen `season` ile aynı bilgiyi taşıdığı için
+# engineer_features içinde düşürülür (tekrarı önlemek için).
+CATEGORICAL_FEATURES = [
+    "vehicle_type", "weather_type", "season", "cevre_temizligi",
+]
 
 
 # --------------------------------------------------------------------------- #
@@ -126,12 +133,51 @@ def engineer_features(df: pd.DataFrame) -> pd.DataFrame:
     df["veh_failures_last_90d"] = fe.transform(
         lambda s: s.shift(1, fill_value=0).rolling(90, min_periods=1).sum()
     )
+
+    # --- Birikimli hava stresi (tarih bazlı; temp/weather tüm filoda aynı) ---
+    # Tek tarih serisi üzerinden hesaplayıp geri birleştir. Pencereler aynı-gün
+    # dahil (geçmiş+bugünün hava DURUMU gözlemlenmiştir -> sızıntı yok).
+    daily_w = (
+        df.drop_duplicates("date").set_index("date").sort_index()["temp"]
+    )
+    roll = pd.DataFrame(index=daily_w.index)
+    roll["temp_7d_mean"] = daily_w.rolling(7, min_periods=1).mean()
+    roll["temp_7d_max"] = daily_w.rolling(7, min_periods=1).max()
+    roll["temp_30d_max"] = daily_w.rolling(30, min_periods=1).max()
+    roll["hot_days_7d"] = (daily_w >= 30).rolling(7, min_periods=1).sum()
+    roll["hot_days_14d"] = (daily_w >= 30).rolling(14, min_periods=1).sum()
+    roll["cold_days_7d"] = (daily_w <= 0).rolling(7, min_periods=1).sum()
+    df = df.merge(roll, left_on="date", right_index=True, how="left")
+
+    # --- Hava tipi (WMO kodu) ayrıştırması: ordinal yerine anlamlı bayraklar ---
+    wt = df["weather_type"]
+    df["is_precip"] = (wt >= 51).astype(int)   # 51+ : çiseleme/yağmur/kar
+    df["is_rain"] = wt.between(61, 69).astype(int)
+    df["is_snow"] = wt.between(71, 79).astype(int)
+
+    # --- Bakım gecikmesi / kullanım yoğunluğu etkileşimleri (aynı-gün bilinir) ---
+    df["km_per_day_since_maint"] = df["km_since_last_maintenance"] / (
+        df["days_since_last_maintenance"] + eps
+    )
+    df["age_x_km_since_maint"] = df["vehicle_age"] * df["km_since_last_maintenance"]
+    df["age_x_km30"] = df["vehicle_age"] * df["km_last_30d"]
+    df["km_today_vs_7davg"] = df["km_today"] / (df["km_last_7d"] / 7 + eps)
+
+    # --- Arıza geçmişi dönüşümleri (days_since_last_failure aynı-gün gözlemli) ---
+    df["log_days_since_failure"] = np.log1p(df["days_since_last_failure"])
+    df["recent_failure_30d"] = (df["days_since_last_failure"] <= 30).astype(int)
+    df["recent_failure_90d"] = (df["days_since_last_failure"] <= 90).astype(int)
+
     # Yardımcı/sürüklenen kolonları düşür:
     #  - failure_event: bugünü gösterir -> sızıntı, özellik OLAMAZ.
     #  - veh_past_obs & veh_past_failures: zamanla monoton büyür (time-index proxy);
     #    zaman-bazlı split'te dağılım kayması yaratıp genellemeyi bozar. Sadece
     #    durağan veh_past_failure_rate ve veh_failures_last_90d özellik olarak kalır.
     df = df.drop(columns=["failure_event", "veh_past_obs", "veh_past_failures"])
+
+    # `mevsim` ham sütunu, yukarıda aydan türetilen `season` ile aynı bilgiyi taşır;
+    # tekrarı önlemek için düşürülür (varsa).
+    df = df.drop(columns=["mevsim"], errors="ignore")
 
     return df
 
@@ -145,14 +191,21 @@ def get_feature_columns(df: pd.DataFrame) -> list[str]:
 # --------------------------------------------------------------------------- #
 # 4. Takvim bazlı bölme
 # --------------------------------------------------------------------------- #
-def time_based_split(df: pd.DataFrame):
-    """Tarih aralığına göre 80/20 train/test (takvim bazlı). Kronolojik kesim — sızıntı yok."""
+def time_based_split(df: pd.DataFrame, test_end: pd.Timestamp | None = None):
+    """Tarih aralığına göre 80/20 train/test (takvim bazlı). Kronolojik kesim — sızıntı yok.
+
+    test_end verilirse, test setinde bu tarihten (dahil) SONRAKİ satırlar atılır.
+    Veri sonundaki günlerde failure_next_30d için tam 30 günlük ileri pencere
+    bulunmadığından (etiket eksik/güvenilmez), kuyruk böyle kırpılabilir.
+    """
     df_sorted = df.sort_values("date").reset_index(drop=True)
     dmin, dmax = df_sorted["date"].min(), df_sorted["date"].max()
     span = dmax - dmin
     train_end = dmin + span * TRAIN_FRAC
     train = df_sorted[df_sorted["date"] <= train_end]
     test = df_sorted[df_sorted["date"] > train_end]
+    if test_end is not None:
+        test = test[test["date"] <= test_end]
     return train, test
 
 
@@ -546,6 +599,13 @@ def main():
                              "(1 arıza : 2 normal).")
     parser.add_argument("--predict", default=None,
                         help="Eğitim sonrası skorlanacak ek CSV yolu")
+    parser.add_argument("--test-end", default=None,
+                        help="Test setinde bu tarihten (dahil) sonrasını dışla. "
+                             "Ör: 2025-12-01 (etiketi eksik kuyruk günlerini at).")
+    parser.add_argument("--test-neg-keep", type=float, default=1.0,
+                        help="Test negatiflerinin (failure=0) tutulacak oranı [0-1]. "
+                             "Precision deneyi: <1 verilince negatifler rastgele "
+                             "altörneklenir (train'e DOKUNULMAZ).")
     args = parser.parse_args()
 
     os.makedirs(args.out, exist_ok=True)
@@ -562,7 +622,26 @@ def main():
     assert TARGET not in feature_cols and OTHER_LABEL not in feature_cols, "Sızıntı!"
 
     # 4) Takvim bazlı bölme
-    train, test = time_based_split(df)
+    test_end = pd.to_datetime(args.test_end) if args.test_end else None
+    train, test = time_based_split(df, test_end=test_end)
+    if test_end is not None:
+        print(f"[test-end] Test {test_end.date()} sonrası dışlandı.")
+
+    # 4b) (Opsiyonel) Precision deneyi: test negatiflerini altörnekle.
+    #     Pozitifler (failure=1) korunur; negatiflerin yalnız bir kısmı tutulur.
+    #     Bu, test sınıf dağılımını yapay olarak dengeler -> daha az FP -> precision
+    #     yükselir. Train'e dokunulmaz; gerçek operasyon precision'ı değil, sınıf
+    #     dengesi precision'ı nasıl etkiliyor onu görmek için bir what-if'tir.
+    if args.test_neg_keep < 1.0:
+        pos = test[test[TARGET] == 1]
+        neg = test[test[TARGET] == 0]
+        neg_kept = neg.sample(frac=args.test_neg_keep, random_state=RANDOM_STATE)
+        n_neg_before = len(neg)
+        test = pd.concat([pos, neg_kept]).sort_values("date").reset_index(drop=True)
+        print(f"[test-neg-keep={args.test_neg_keep:.2f}] test negatif: "
+              f"{n_neg_before} -> {len(neg_kept)} | pozitif: {len(pos)} (sabit) | "
+              f"yeni 1-oranı: {len(pos)/len(test)*100:.1f}%")
+
     print(f"Train size: {len(train)}  dates: {_fmt_range(train)}")
     print(f"Test  size: {len(test)}  dates: {_fmt_range(test)}")
 
